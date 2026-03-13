@@ -50,6 +50,72 @@ const inferShift = (entryTime, existingShift) => {
   return hour >= 6 && hour < 19 ? 'D' : 'N';
 };
 
+const normalizeText = (value) => (value ?? '').toString().trim().toLowerCase();
+
+const toIsoDate = (value) => {
+  const text = (value ?? '').toString().trim();
+  if (!text || text === '-') return '';
+
+  const isoExact = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (isoExact) return `${isoExact[1]}-${isoExact[2]}-${isoExact[3]}`;
+
+  const isoPrefix = /^(\d{4})-(\d{2})-(\d{2})/.exec(text);
+  if (isoPrefix) return `${isoPrefix[1]}-${isoPrefix[2]}-${isoPrefix[3]}`;
+
+  const yearLast = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(text);
+  if (yearLast) {
+    const [, partAText, partBText, yearText] = yearLast;
+    const a = Number(partAText);
+    const b = Number(partBText);
+
+    if (!Number.isNaN(a) && !Number.isNaN(b)) {
+      let month = a;
+      let day = b;
+
+      if (a > 12 && b <= 12) {
+        day = a;
+        month = b;
+      } else if (b > 12 && a <= 12) {
+        month = a;
+        day = b;
+      }
+
+      return `${yearText}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+  }
+
+  const yearFirst = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(text);
+  if (yearFirst) {
+    const [, yearText, monthText, dayText] = yearFirst;
+    return `${yearText}-${monthText.padStart(2, '0')}-${dayText.padStart(2, '0')}`;
+  }
+
+  const shortYear = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2})$/.exec(text);
+  if (shortYear) {
+    const [, partAText, partBText, yearText] = shortYear;
+    const a = Number(partAText);
+    const b = Number(partBText);
+    const year = 2000 + Number(yearText);
+
+    if (!Number.isNaN(a) && !Number.isNaN(b)) {
+      let month = a;
+      let day = b;
+
+      if (a > 12 && b <= 12) {
+        day = a;
+        month = b;
+      } else if (b > 12 && a <= 12) {
+        month = a;
+        day = b;
+      }
+
+      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+  }
+
+  return '';
+};
+
 const normalizeRecord = (item, index) => {
   const workerName =
     item.worker_name || item.employee_name || item.nombre_trabajador || item.provider_name || '-';
@@ -79,13 +145,17 @@ function App() {
   const [records, setRecords] = useState([]);
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
+  const [filterBy, setFilterBy] = useState('nombre');
+  const [filterName, setFilterName] = useState('');
+  const [filterDateFrom, setFilterDateFrom] = useState('');
+  const [filterDateTo, setFilterDateTo] = useState('');
 
   const fetchRecords = async () => {
     try {
       const response = await api.get('/invoices');
       const data = Array.isArray(response.data) ? response.data : [];
       setRecords(data.map(normalizeRecord));
-    } catch (error) {
+    } catch {
       toast.error('No se pudo cargar el historial', {
         description: 'Verifica que el backend este activo.',
       });
@@ -93,7 +163,11 @@ function App() {
   };
 
   useEffect(() => {
-    fetchRecords();
+    const timer = setTimeout(() => {
+      fetchRecords();
+    }, 0);
+
+    return () => clearTimeout(timer);
   }, []);
 
   const uploadPdf = (file) => {
@@ -175,8 +249,62 @@ function App() {
     setUploadingBulk(false);
   };
 
+  const stats = useMemo(() => {
+    const signatureOk = records.filter((item) => item.hasSignature).length;
+    const dayShift = records.filter((item) => isDayShift(item.shift)).length;
+    const nightShift = records.filter((item) => isNightShift(item.shift)).length;
+    return { signatureOk, dayShift, nightShift };
+  }, [records]);
+
+  const isBusy = uploadingSingle || uploadingBulk;
+  const isEditMode = topView === 'editar';
+  const hasActiveFilter =
+    (filterBy === 'nombre' && filterName.trim()) || (filterBy === 'fecha' && (filterDateFrom || filterDateTo));
+
+  const displayRecords = useMemo(() => {
+    if (!hasActiveFilter) return records;
+
+    if (filterBy === 'nombre') {
+      const query = normalizeText(filterName);
+      if (!query) return records;
+      return records.filter((record) => normalizeText(record.workerName).includes(query));
+    }
+
+    if (filterBy === 'fecha') {
+      if (!filterDateFrom && !filterDateTo) return records;
+
+      const normalizedFrom = filterDateFrom ? toIsoDate(filterDateFrom) : '';
+      const normalizedTo = filterDateTo ? toIsoDate(filterDateTo) : '';
+      const startIso = normalizedFrom && normalizedTo ? (normalizedFrom <= normalizedTo ? normalizedFrom : normalizedTo) : normalizedFrom || normalizedTo;
+      const endIso = normalizedFrom && normalizedTo ? (normalizedFrom <= normalizedTo ? normalizedTo : normalizedFrom) : normalizedTo || normalizedFrom;
+
+      return records.filter((record) => {
+        const recordIso = toIsoDate(record.date);
+        if (!recordIso) return false;
+        if (startIso && recordIso < startIso) return false;
+        if (endIso && recordIso > endIso) return false;
+        return true;
+      });
+    }
+
+    return records;
+  }, [filterBy, filterDateFrom, filterDateTo, filterName, hasActiveFilter, records]);
+
+  const clearFilter = () => {
+    setFilterName('');
+    setFilterDateFrom('');
+    setFilterDateTo('');
+  };
+
   const exportToExcel = () => {
-    const rows = records.map((record) => ({
+    if (displayRecords.length === 0) {
+      toast.warning('No hay datos para exportar', {
+        description: records.length === 0 ? 'Aun no existen registros.' : 'El filtro actual no tiene resultados.',
+      });
+      return;
+    }
+
+    const rows = displayRecords.map((record) => ({
       Nombre_Trabajador: record.workerName,
       DNI: record.dni,
       Fecha: record.date,
@@ -192,16 +320,6 @@ function App() {
     XLSX.writeFile(workbook, 'Reporte_Asistencia.xlsx');
     toast.success('Excel exportado');
   };
-
-  const stats = useMemo(() => {
-    const signatureOk = records.filter((item) => item.hasSignature).length;
-    const dayShift = records.filter((item) => isDayShift(item.shift)).length;
-    const nightShift = records.filter((item) => isNightShift(item.shift)).length;
-    return { signatureOk, dayShift, nightShift };
-  }, [records]);
-
-  const isBusy = uploadingSingle || uploadingBulk;
-  const isEditMode = topView === 'editar';
 
   const startEdit = (record) => {
     setEditingId(record.id);
@@ -352,12 +470,70 @@ function App() {
           <div className="flex flex-col gap-4 border-b border-slate-200/70 bg-white/70 p-4 md:flex-row md:items-center md:justify-between">
             <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-800">
               <DocumentMagnifyingGlassIcon className="h-5 w-5" />
-              {isEditMode ? `Edicion de Registros (${records.length})` : 'Datos extraidos por documento'}
+              {isEditMode
+                ? `Edicion de Registros (${displayRecords.length}${hasActiveFilter ? `/${records.length}` : ''})`
+                : `Datos extraidos por documento (${displayRecords.length}${hasActiveFilter ? `/${records.length}` : ''})`}
             </h2>
-            <button onClick={exportToExcel} className="export-button">
-              <ArrowDownTrayIcon className="h-4 w-4" />
-              Exportar Excel
-            </button>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Filtrar por
+                  <select
+                    value={filterBy}
+                    onChange={(e) => setFilterBy(e.target.value)}
+                    className="ml-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-800 shadow-sm"
+                  >
+                    <option value="nombre">Nombre</option>
+                    <option value="fecha">Fecha</option>
+                  </select>
+                </label>
+
+                {filterBy === 'nombre' ? (
+                  <input
+                    type="text"
+                    value={filterName}
+                    onChange={(e) => setFilterName(e.target.value)}
+                    placeholder="Buscar trabajador..."
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm"
+                  />
+                ) : (
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <input
+                      type="date"
+                      value={filterDateFrom}
+                      onChange={(e) => setFilterDateFrom(e.target.value)}
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm"
+                      aria-label="Fecha desde"
+                    />
+                    <span className="hidden text-sm font-semibold text-slate-500 sm:inline">a</span>
+                    <input
+                      type="date"
+                      value={filterDateTo}
+                      onChange={(e) => setFilterDateTo(e.target.value)}
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm"
+                      aria-label="Fecha hasta"
+                    />
+                  </div>
+                )}
+
+                {hasActiveFilter && (
+                  <button
+                    type="button"
+                    onClick={clearFilter}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50"
+                    title="Limpiar filtro"
+                  >
+                    <XMarkIcon className="h-4 w-4" />
+                    Limpiar
+                  </button>
+                )}
+              </div>
+
+              <button onClick={exportToExcel} className="export-button">
+                <ArrowDownTrayIcon className="h-4 w-4" />
+                Exportar Excel
+              </button>
+            </div>
           </div>
 
           <div className="max-h-[560px] overflow-auto bg-white/80">
@@ -381,8 +557,14 @@ function App() {
                       Aun no hay registros. Sube el primer PDF para comenzar.
                     </td>
                   </tr>
+                ) : displayRecords.length === 0 ? (
+                  <tr>
+                    <td className="px-4 py-10 text-center text-slate-500" colSpan={isEditMode ? 8 : 7}>
+                      No hay resultados con el filtro actual.
+                    </td>
+                  </tr>
                 ) : (
-                  records.map((record) => (
+                  displayRecords.map((record) => (
                     <tr key={record.id} className="hover:bg-[#fff8ef] transition-colors">
                       <td className="px-4 py-3 font-semibold text-slate-800">
                         {editingId === record.id ? (
